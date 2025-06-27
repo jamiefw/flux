@@ -20,3 +20,5 @@ REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
 REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
 SFBAY_API_TOKEN = os.getenv("SFBAY_API_TOKEN")
 SFMTA_AGENCY_ID = "SF" 
+MTA_BUS_API_KEY = os.getenv("MTA_BUS_API_KEY") 
+MTA_AGENCY_ID = "MTA NYCT"
