@@ -22,3 +22,8 @@ SFBAY_API_TOKEN = os.getenv("SFBAY_API_TOKEN")
 SFMTA_AGENCY_ID = "SF" 
 MTA_BUS_API_KEY = os.getenv("MTA_BUS_API_KEY") 
 MTA_AGENCY_ID = "MTA NYCT"
+# --- New Bay Wheels GBFS URLs ---
+BAY_WHEELS_STATION_INFO_URL = "https://gbfs.lyft.com/gbfs/2.3/bay/en/station_information.json" 
+BAY_WHEELS_STATION_STATUS_URL = "https://gbfs.lyft.com/gbfs/2.3/bay/en/station_status.json" 
+BAY_WHEELS_GBFS_URL = "https://gbfs.lyft.com/gbfs/2.3/bay/gbfs.json"
+CITI_BIKE_GBFS_URL = "https://gbfs.lyft.com/gbfs/2.3/bkn/gbfs.json"
