@@ -27,3 +27,9 @@ BAY_WHEELS_STATION_INFO_URL = "https://gbfs.lyft.com/gbfs/2.3/bay/en/station_inf
 BAY_WHEELS_STATION_STATUS_URL = "https://gbfs.lyft.com/gbfs/2.3/bay/en/station_status.json" 
 BAY_WHEELS_GBFS_URL = "https://gbfs.lyft.com/gbfs/2.3/bay/gbfs.json"
 CITI_BIKE_GBFS_URL = "https://gbfs.lyft.com/gbfs/2.3/bkn/gbfs.json"
+OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY") # This should be loaded from .env.local
+OPENWEATHER_API_URL = "https://api.openweathermap.org/data/2.5/weather"
+
+# Coordinates for SF and NYC
+SF_COORDS = {"lat": 37.7749, "lon": -122.4194, "name": "San Francisco"}
+NYC_COORDS = {"lat": 40.7128, "lon": -74.0060, "name": "New York City"}
