@@ -19,7 +19,7 @@ from alembic import context
 
 from backend.app.db.session import Base  # Import your Base
 from backend.app.models import vehicle_position # Import your models module
-
+from backend.app.models import bike_station
 target_metadata = Base.metadata
 
 
