@@ -2,22 +2,69 @@
 import os
 import sys
 import requests
-import datetime
+from datetime import datetime, date, timezone # Explicitly import date, timezone
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import SQLAlchemyError
+import tenacity # NEW IMPORT for retry logic
+from pydantic import BaseModel, Field, ValidationError # NEW IMPORT for data validation
 
-# Ensure sys.path is correct for this file (goes up to 'flux/' root)
+# Ensure sys.path is correct for imports from backend.app
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..', '..')))
 
 from backend.app.db.session import SessionLocal
 from backend.app.models.bike_station import BikeStation, BikeStationStatus
 from backend.app.core.config import BAY_WHEELS_GBFS_URL
 
-from dotenv import load_dotenv # Needed here as well for direct script execution
+from dotenv import load_dotenv # Needed here for manual execution
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), '../../../.env.local'))
 
 # This will hold the URLs after discovery
 GBFS_FEEDS = {}
+
+# --- Pydantic Models for Data Validation ---
+class BikeStationData(BaseModel):
+    station_id: str = Field(..., max_length=50)
+    name: str = Field(..., max_length=255)
+    latitude: float
+    longitude: float
+    capacity: int | None = None
+    rental_methods: str | None = Field(None, max_length=255)
+    external_id: str | None = Field(None, max_length=255)
+    address: str | None = Field(None, max_length=255)
+    region_id: str | None = Field(None, max_length=50)
+    is_charging_station: bool | None = None
+    parking_type: str | None = Field(None, max_length=50)
+    last_updated: datetime | None = None
+
+class BikeStationStatusData(BaseModel):
+    station_id: str = Field(..., max_length=50)
+    num_bikes_available: int
+    num_docks_available: int
+    num_ebikes_available: int | None = None
+    num_scooters_available: int | None = None
+    is_renting: bool
+    is_returning: bool
+    is_installed: bool
+    last_reported: datetime
+
+# --- Tenacity Retry Strategy ---
+retry_strategy = tenacity.retry(
+    stop=tenacity.stop_after_attempt(5),
+    wait=tenacity.wait_fixed(2),
+    retry=tenacity.retry_if_exception_type(requests.exceptions.RequestException),
+    reraise=True
+)
+
+@retry_strategy
+def fetch_gbfs_json_data(url: str) -> dict:
+    """
+    Fetches JSON data from a GBFS URL with retry logic.
+    """
+    print(f"[{datetime.now()}] Fetching raw JSON data from: {url}")
+    response = requests.get(url, timeout=30)
+    response.raise_for_status()
+    print(f"[{datetime.now()}] Successfully received raw JSON data.")
+    return response.json()
 
 def fetch_gbfs_feed_urls():
     """
@@ -26,26 +73,28 @@ def fetch_gbfs_feed_urls():
     """
     global GBFS_FEEDS
     if GBFS_FEEDS:
-        return GBFS_FEEDS # Use cached URLs if already fetched
+        return GBFS_FEEDS
 
-    print(f"[{datetime.datetime.now()}] Discovering GBFS feed URLs from: {BAY_WHEELS_GBFS_URL}...")
+    print(f"[{datetime.now()}] Discovering GBFS feed URLs from: {BAY_WHEELS_GBFS_URL}...")
     try:
-        response = requests.get(BAY_WHEELS_GBFS_URL, timeout=15)
-        response.raise_for_status()
-        feed_data = response.json()
+        feed_data = fetch_gbfs_json_data(BAY_WHEELS_GBFS_URL) # Use the new robust fetcher
 
-        # The GBFS discovery JSON you provided has 'data' -> 'en' -> 'feeds'
         feeds = feed_data.get('data', {}).get('en', {}).get('feeds', [])
         
-        # Populate the GBFS_FEEDS dictionary for easy lookup by feed name
         for feed in feeds:
             GBFS_FEEDS[feed['name']] = feed['url']
         
-        print("Successfully discovered GBFS feeds:", list(GBFS_FEEDS.keys()))
+        print(f"[{datetime.now()}] Successfully discovered GBFS feeds: {list(GBFS_FEEDS.keys())}")
         return GBFS_FEEDS
     
+    except tenacity.RetryError as e:
+        print(f"[{datetime.now()}] Fatal API error after all retries for GBFS discovery: {e}")
+        return {}
     except requests.exceptions.RequestException as e:
-        print(f"Error fetching GBFS discovery feed: {e}")
+        print(f"[{datetime.now()}] Network error fetching GBFS discovery feed: {e}")
+        return {}
+    except Exception as e:
+        print(f"[{datetime.now()}] An unexpected error occurred during GBFS discovery: {e}")
         return {}
 
 
@@ -58,60 +107,71 @@ def fetch_and_store_static_station_info():
     station_info_url = feeds.get('station_information')
     
     if not station_info_url:
-        print("Station information URL not found in GBFS feed. Aborting static data collection.")
+        print(f"[{datetime.now()}] Station information URL not found in GBFS feed. Aborting static data collection.")
         return
 
-    print(f"[{datetime.datetime.now()}] Fetching static station info from: {station_info_url}...")
+    print(f"[{datetime.now()}] Fetching static station info from: {station_info_url}...")
     db: Session = SessionLocal()
     try:
-        response = requests.get(station_info_url, timeout=30)
-        response.raise_for_status()
-        data = response.json()
+        data = fetch_gbfs_json_data(station_info_url) # Use the new robust fetcher
         
         stations_data = data.get('data', {}).get('stations', [])
-        print(f"Successfully fetched {len(stations_data)} static station records.")
+        print(f"[{datetime.now()}] Successfully fetched {len(stations_data)} static station records.")
 
         for station_info in stations_data:
-            # Check for essential fields
-            if station_info.get('station_id') and station_info.get('lat') and station_info.get('lon'):
-                # Check if station already exists
-                existing_station = db.query(BikeStation).filter(BikeStation.station_id == station_info['station_id']).first()
-                
-                # Use a dictionary to prepare data for update/insert
-                station_data = {
-                    'station_id': station_info.get('station_id'),
-                    'name': station_info.get('name'),
-                    'latitude': station_info.get('lat'),
-                    'longitude': station_info.get('lon'),
-                    'capacity': station_info.get('capacity'),
-                    'rental_methods': ','.join(station_info.get('rental_methods', [])), # Join list into a string
-                    'external_id': station_info.get('external_id'),
-                    'address': station_info.get('address'),
-                    'region_id': station_info.get('region_id'),
-                    'is_charging_station': station_info.get('is_charging_station'),
-                    'parking_type': station_info.get('parking_type'),
-                    'last_updated': datetime.datetime.fromtimestamp(data.get('last_updated', 0)) # Use feed's last_updated timestamp
-                }
+            # Prepare data for Pydantic validation
+            station_data_dict = {
+                'station_id': station_info.get('station_id'),
+                'name': station_info.get('name'),
+                'latitude': station_info.get('lat'),
+                'longitude': station_info.get('lon'),
+                'capacity': station_info.get('capacity'),
+                'rental_methods': ','.join(station_info.get('rental_methods', [])),
+                'external_id': station_info.get('external_id'),
+                'address': station_info.get('address'),
+                'region_id': station_info.get('region_id'),
+                'is_charging_station': station_info.get('is_charging_station'),
+                'parking_type': station_info.get('parking_type'),
+                'last_updated': datetime.fromtimestamp(data.get('last_updated', 0), tz=timezone.utc) # Use feed's last_updated timestamp
+            }
 
+            try:
+                validated_data = BikeStationData(**station_data_dict)
+                
+                # Check if station already exists for upsert
+                existing_station = db.query(BikeStation).filter(BikeStation.station_id == validated_data.station_id).first()
+                
                 if existing_station:
-                    # Update existing record
-                    for key, value in station_data.items():
+                    # Update existing record using validated data
+                    for key, value in validated_data.model_dump(exclude_unset=True).items(): # Only update fields that were explicitly set
                         setattr(existing_station, key, value)
-                    print(f"Updated static info for station: {station_info['station_id']}")
+                    print(f"[{datetime.now()}] Updated static info for station: {validated_data.station_id}")
                 else:
                     # Insert new record
-                    new_station = BikeStation(**station_data)
+                    new_station = BikeStation(**validated_data.model_dump())
                     db.add(new_station)
-                    print(f"Inserted new static info for station: {station_info['station_id']}")
-            else:
-                print(f"Skipping static record due to missing essential data: {station_info}")
+                    print(f"[{datetime.now()}] Inserted new static info for station: {validated_data.station_id}")
+            
+            except ValidationError as e:
+                print(f"[{datetime.now()}] Data validation failed for static station record '{station_info.get('station_id')}': {e}. Skipping record.")
+            except Exception as e:
+                print(f"[{datetime.now()}] Unexpected error during static station data processing for '{station_info.get('station_id')}': {e}. Skipping record.")
 
         db.commit()
-    except requests.exceptions.RequestException as e:
-        print(f"Network error fetching station info: {e}")
-    except SQLAlchemyError as e:
+        print(f"[{datetime.now()}] Bay Wheels static station info upsert complete.")
+
+    except tenacity.RetryError as e:
+        print(f"[{datetime.now()}] Fatal API error after all retries for static station info: {e}")
         db.rollback()
-        print(f"Database error during static station info upsert: {e}")
+    except requests.exceptions.RequestException as e:
+        print(f"[{datetime.now()}] Network error fetching static station info: {e}")
+        db.rollback()
+    except SQLAlchemyError as e:
+        print(f"[{datetime.now()}] Database error during static station info upsert: {e}")
+        db.rollback()
+    except Exception as e:
+        print(f"[{datetime.now()}] An unexpected error occurred during static station info collection: {e}")
+        db.rollback()
     finally:
         db.close()
 
@@ -125,56 +185,68 @@ def fetch_and_store_realtime_station_status():
     station_status_url = feeds.get('station_status')
     
     if not station_status_url:
-        print("Station status URL not found in GBFS feed. Aborting real-time data collection.")
+        print(f"[{datetime.now()}] Station status URL not found in GBFS feed. Aborting real-time data collection.")
         return
 
-    print(f"[{datetime.datetime.now()}] Fetching real-time station status from: {station_status_url}...")
+    print(f"[{datetime.now()}] Fetching real-time station status from: {station_status_url}...")
     db: Session = SessionLocal()
     try:
-        response = requests.get(station_status_url, timeout=30)
-        response.raise_for_status()
-        data = response.json()
+        data = fetch_gbfs_json_data(station_status_url) # Use the new robust fetcher
         
         statuses_data = data.get('data', {}).get('stations', [])
         last_reported_timestamp = data.get('last_updated', None)
         
         if last_reported_timestamp:
-            last_reported_dt = datetime.datetime.fromtimestamp(last_reported_timestamp, tz=datetime.timezone.utc)
+            last_reported_dt = datetime.fromtimestamp(last_reported_timestamp, tz=timezone.utc)
         else:
-            print("Warning: 'last_updated' timestamp missing from status feed. Using current time.")
-            last_reported_dt = datetime.datetime.now(datetime.timezone.utc)
+            print(f"[{datetime.now()}] Warning: 'last_updated' timestamp missing from status feed. Using current time.")
+            last_reported_dt = datetime.now(timezone.utc)
 
         new_status_records = []
         for status_info in statuses_data:
-            # Ensure station_id and availability numbers are present
-            if status_info.get('station_id') and status_info.get('num_bikes_available') is not None and status_info.get('num_docks_available') is not None:
-                new_status = BikeStationStatus(
-                    station_id=status_info['station_id'],
-                    num_bikes_available=status_info.get('num_bikes_available'),
-                    num_docks_available=status_info.get('num_docks_available'),
-                    num_ebikes_available=status_info.get('num_ebikes_available'),
-                    num_scooters_available=status_info.get('num_scooters_available'),
-                    is_renting=bool(status_info.get('is_renting')), # Convert to boolean
-                    is_returning=bool(status_info.get('is_returning')), # Convert to boolean
-                    is_installed=bool(status_info.get('is_installed')), # Convert to boolean
-                    last_reported=datetime.datetime.fromtimestamp(status_info.get('last_reported', last_reported_timestamp), tz=datetime.timezone.utc)
-                )
+            # Prepare data for Pydantic validation
+            status_data_dict = {
+                'station_id': status_info.get('station_id'),
+                'num_bikes_available': status_info.get('num_bikes_available'),
+                'num_docks_available': status_info.get('num_docks_available'),
+                'num_ebikes_available': status_info.get('num_ebikes_available'),
+                'num_scooters_available': status_info.get('num_scooters_available'),
+                'is_renting': bool(status_info.get('is_renting')),
+                'is_returning': bool(status_info.get('is_returning')),
+                'is_installed': bool(status_info.get('is_installed')),
+                'last_reported': datetime.fromtimestamp(status_info.get('last_reported', last_reported_timestamp), tz=timezone.utc)
+            }
+            
+            try:
+                validated_data = BikeStationStatusData(**status_data_dict)
+                new_status = BikeStationStatus(**validated_data.model_dump())
                 new_status_records.append(new_status)
-            else:
-                print(f"Skipping status record due to missing essential data: {status_info}")
+            except ValidationError as e:
+                print(f"[{datetime.now()}] Data validation failed for status record '{status_info.get('station_id')}': {e}. Skipping record.")
+            except Exception as e:
+                print(f"[{datetime.now()}] Unexpected error during status data processing for '{status_info.get('station_id')}': {e}. Skipping record.")
+                continue # Skip to next entity if processing fails
         
         if new_status_records:
             db.add_all(new_status_records)
             db.commit()
-            print(f"Successfully stored {len(new_status_records)} new Bay Wheels station status records.")
+            print(f"[{datetime.now()}] Successfully stored {len(new_status_records)} new Bay Wheels station status records.")
         else:
-            print("No new valid Bay Wheels station status records to store.")
+            print(f"[{datetime.now()}] No new valid Bay Wheels station status records to store.")
             
+    except tenacity.RetryError as e:
+        print(f"[{datetime.now()}] Fatal API error after all retries for real-time station status: {e}")
+        db.rollback()
     except requests.exceptions.RequestException as e:
-        print(f"Network error fetching station status: {e}")
+        print(f"[{datetime.now()}] Network error fetching station status: {e}")
+        db.rollback()
     except SQLAlchemyError as e:
         db.rollback()
-        print(f"Database error during station status insertion: {e}")
+        print(f"[{datetime.now()}] Database error during station status insertion: {e}")
+        db.rollback()
+    except Exception as e:
+        print(f"[{datetime.now()}] An unexpected error occurred during real-time station status collection: {e}")
+        db.rollback()
     finally:
         db.close()
 
@@ -182,7 +254,7 @@ def fetch_and_store_realtime_station_status():
 if __name__ == "__main__":
     # Example usage for manual execution
     # Run this once a day or manually to update static info
-    # fetch_and_store_static_station_info() 
+    fetch_and_store_static_station_info() 
     
     # Run this every 60 seconds via a scheduler (e.g., asyncio loop, cron job)
-    fetch_and_store_realtime_station_status()
+    # fetch_and_store_realtime_station_status()
